@@ -86,4 +86,5 @@ class PersonalBaseline:
     comfortable_rom_deg: float
     target_rom_deg: float
     rest_value_deg: float
+    posture_reference_deg: float
     calibrated_at: str

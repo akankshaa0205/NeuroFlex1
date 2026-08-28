@@ -29,6 +29,7 @@ def test_profile_and_baseline_round_trip(tmp_path: Path) -> None:
     baseline = {
         "exercise_id": "shoulder-flexion", "side": "Right", "comfortable_rom_deg": 90.0,
         "target_rom_deg": 73.8, "rest_value_deg": 10.0,
+        "posture_reference_deg": 4.0,
         "calibrated_at": "2026-01-01T00:00:00Z",
     }
     repository.save_profile(patient, profile)

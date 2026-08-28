@@ -38,7 +38,7 @@ def test_intake_calibration_then_personalized_session(monkeypatch, tmp_path: Pat
     window._primary_action()
     assert window.state == SessionState.CALIBRATING
     exercise = EXERCISES[window.exercise.currentIndex()]
-    window._finish_calibration(exercise, 100, 12)
+    window._finish_calibration(exercise, 100, 12, 4)
     assert window.baselines[exercise.id].target_rom_deg == pytest.approx(77.9)
     window._primary_action()
     assert window.state == SessionState.ACTIVE

@@ -15,7 +15,7 @@ def yes_no(value: bool) -> str:
 print("NeuroFlex system check")
 print(f"Platform: {platform.platform()}")
 print(f"Python: {platform.python_version()}")
-model = Path("models/pose_landmarker_lite.task")
+model = Path("models/pose_landmarker_full.task")
 print(f"Pose model: {yes_no(model.exists())} ({model})")
 camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 print(f"Camera: {yes_no(camera.isOpened())}")
