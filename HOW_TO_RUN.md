@@ -16,6 +16,11 @@ The joints used by the selected exercise are highlighted in yellow. The current 
 recalibrated once so posture can be judged
 relative to the user's natural starting pose instead of the camera placement.
 
+After calibration, optionally enable **touch-free gesture controls**. Bring both hands together
+over the center of your chest and hold for about 1.2 seconds to start, pause, or resume. Separate
+your hands after each accepted command before using the gesture again. Gestures do not operate
+during setup or calibration, and the normal buttons always remain available.
+
 ## First-time setup
 
 If dependencies need to be restored:

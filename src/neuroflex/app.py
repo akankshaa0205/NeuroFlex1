@@ -11,6 +11,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
 from neuroflex.domain.coach import CoachPhase, CoachUpdate, SessionCoach
 from neuroflex.domain.exercises import EXERCISES, movement_signal
 from neuroflex.domain.feedback import assess_live_movement, choose_active_side
+from neuroflex.domain.gestures import GestureDebouncer, hands_together_at_chest
 from neuroflex.domain.guidance import guidance_for
 from neuroflex.domain.kinematics import extract_joint_angle, smooth_angles, torso_lean_degrees
 from neuroflex.domain.models import PatientIntake, PersonalBaseline, SessionState
@@ -225,6 +227,9 @@ class MainWindow(QMainWindow):
         self.calibration_last_valid_at: float | None = None
         self.calibration_armed = False
         self.tracking_lost_at: float | None = None
+        self.gesture_debouncer = GestureDebouncer(
+            dwell_frames=24, cooldown_frames=40, confidence_threshold=0.35
+        )
         self._load_personalization()
         self.started_at = datetime.now(UTC)
         self.coach: SessionCoach | None = None
@@ -363,6 +368,16 @@ class MainWindow(QMainWindow):
         controls.setObjectName("muted")
         controls.setWordWrap(True)
         right.addWidget(controls)
+        self.gesture_enabled = QCheckBox("Enable touch-free gesture controls")
+        self.gesture_enabled.setChecked(False)
+        self.gesture_enabled.toggled.connect(self._gesture_toggled)
+        right.addWidget(self.gesture_enabled)
+        self.gesture_status = QLabel(
+            "Gestures off • buttons always remain available"
+        )
+        self.gesture_status.setObjectName("muted")
+        self.gesture_status.setWordWrap(True)
+        right.addWidget(self.gesture_status)
         layout.addLayout(right, 2)
         return page
 
@@ -531,6 +546,7 @@ class MainWindow(QMainWindow):
                 ).copy()
                 self.canvas.visibility = self.camera.last_visibility.copy()
                 self.camera_error = None
+                self._process_gesture(landmarks)
             except (OSError, RuntimeError, ValueError) as error:
                 self.camera_error = str(error)
         if landmarks is None:
@@ -751,6 +767,61 @@ class MainWindow(QMainWindow):
         if self.camera is None:
             return 0.0
         return float(np.min(self.camera.last_visibility[np.asarray(triplet)]))
+
+    def _gesture_toggled(self, enabled: bool) -> None:
+        self.gesture_debouncer.clear()
+        if not enabled:
+            self.gesture_status.setText("Gestures off • buttons always remain available")
+        elif self.camera is None or not self.camera.available:
+            self.gesture_enabled.setChecked(False)
+            self.gesture_status.setText("Gesture control unavailable without the camera")
+        else:
+            self.gesture_status.setText(
+                "Bring both hands together at chest height and hold to start, pause, or resume"
+            )
+
+    def _process_gesture(self, landmarks: np.ndarray | None) -> None:
+        if not self.gesture_enabled.isChecked() or self.camera is None:
+            return
+        action: str | None = None
+        if self.state == SessionState.ACTIVE:
+            action = "pause"
+        elif self.state == SessionState.PAUSED:
+            action = "resume"
+        elif (
+            self.state == SessionState.READY
+            and self.intake is not None
+            and EXERCISES[self.exercise.currentIndex()].id in self.baselines
+        ):
+            action = "start"
+        if action is None:
+            self.gesture_debouncer.update(None, 0.0)
+            self.gesture_status.setText(
+                "Gestures wait during setup and calibration • use the button below"
+            )
+            return
+        detected, confidence = hands_together_at_chest(
+            landmarks if landmarks is not None else np.empty((0, 3)),
+            self.camera.last_visibility,
+        )
+        fired = self.gesture_debouncer.update(
+            "hands_together" if detected else None, confidence
+        )
+        if self.gesture_debouncer.candidate is not None:
+            percent = round(self.gesture_debouncer.progress * 100)
+            self.gesture_status.setText(
+                f"Hands together recognized ({confidence:.0%}) • keep holding… {percent}%"
+            )
+        else:
+            self.gesture_status.setText(
+                f"To {action}: bring both hands together over the center of your chest and hold"
+            )
+        if fired is not None:
+            self._primary_action()
+            result_text = {"start": "started", "resume": "resumed", "pause": "paused"}
+            self.gesture_status.setText(
+                f"Gesture accepted • session {result_text[action]}"
+            )
 
     @staticmethod
     def _framing_cue(exercise) -> str:
