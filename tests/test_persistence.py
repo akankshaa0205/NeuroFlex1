@@ -13,6 +13,7 @@ def test_session_round_trip_and_export(tmp_path: Path) -> None:
     }
     session_id = repository.save_session(patient, payload)
     assert repository.list_sessions()[0]["score"] == 88.5
+    assert repository.list_sessions()[0]["session_id"] == session_id
     payload["session_id"] = session_id
     json_path, csv_path = export_session(payload, tmp_path / "exports")
     assert json_path.exists() and csv_path.exists()
@@ -36,3 +37,5 @@ def test_profile_and_baseline_round_trip(tmp_path: Path) -> None:
     repository.save_baseline(patient, "shoulder-flexion", baseline)
     assert repository.load_profile(patient) == profile
     assert repository.load_baselines(patient) == [baseline]
+    repository.delete_baseline(patient, "shoulder-flexion")
+    assert repository.load_baselines(patient) == []

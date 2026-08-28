@@ -38,6 +38,13 @@ After the baseline is saved, press **Start personalized session**. NeuroFlex pro
 
 The first saved session becomes the Day-1 performance reference; later saves report score and ROM changes from that personal reference. Use **Clinician view** to inspect the trend. Local data is placed in `%USERPROFILE%\.neuroflex`.
 
+After every completed and saved session, NeuroFlex opens a patient report showing repetitions,
+peak range relative to that person's calibrated comfort range and session target, posture
+adherence, tracking coverage, Day-1 change, and next-session guidance. **Latest report** reopens the
+most recent report for the selected exercise. After at least three comparable high-quality sessions
+show sustained improvement, the report may offer a fresh guided recalibration; it never changes a
+baseline automatically and it preserves the original Day-1 history.
+
 ## Verification
 
 ```powershell

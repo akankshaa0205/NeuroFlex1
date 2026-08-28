@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +42,7 @@ from neuroflex.domain.kinematics import extract_joint_angle, smooth_angles, tors
 from neuroflex.domain.models import PatientIntake, PersonalBaseline, SessionState
 from neuroflex.domain.personalization import personalized_target, readiness_message
 from neuroflex.domain.progress import summarize_progress
+from neuroflex.domain.reports import SessionReport, build_session_report
 from neuroflex.persistence import SCHEMA_VERSION, SessionRepository, export_session
 from neuroflex.pose import SKELETON_EDGES, LivePoseCamera
 
@@ -203,6 +205,54 @@ class IntakeDialog(QDialog):
         )
 
 
+class SessionReportDialog(QDialog):
+    def __init__(self, exercise_name: str, report: SessionReport, parent=None) -> None:
+        super().__init__(parent)
+        self.recalibrate_requested = False
+        self.setWindowTitle("Your NeuroFlex session report")
+        self.resize(680, 650)
+        layout = QVBoxLayout(self)
+        viewer = QTextBrowser()
+        change = (
+            f"{report.rom_change_from_day_one_deg:+.1f}°"
+            if report.rom_change_from_day_one_deg is not None
+            else "Day-1 reference established"
+        )
+        guidance = "".join(f"<li>{item}</li>" for item in report.guidance)
+        viewer.setHtml(
+            f"""
+            <style>
+            body {{ color:#e5edf8; font-family:'Segoe UI'; font-size:15px; }}
+            h1 {{ color:#7dd3fc; }} h2 {{ color:#d1fae5; margin-top:22px; }}
+            .card {{ background:#10233a; padding:14px; margin:8px 0; }}
+            .value {{ font-size:25px; font-weight:700; color:#fbbf24; }}
+            </style>
+            <h1>Session complete</h1><p><b>{exercise_name}</b></p>
+            <div class='card'><span class='value'>{report.completed_repetitions} / {report.prescribed_repetitions}</span><br>controlled repetitions completed</div>
+            <div class='card'><span class='value'>{report.achieved_rom_deg:.1f}°</span><br>peak comfortable range • {report.target_attainment_pct:.0f}% of today's personalized target • {report.baseline_attainment_pct:.0f}% of calibrated comfort range</div>
+            <div class='card'><span class='value'>{report.posture_adherence_pct:.0f}%</span><br>posture adherence • tracking coverage {report.tracking_coverage_pct:.0f}%</div>
+            <div class='card'><span class='value'>{change}</span><br>range change from your Day-1 session</div>
+            <h2>Guidance for your next session</h2><ul>{guidance}</ul>
+            <p><i>Investigational wellness feedback—not a diagnosis or replacement for your clinician's instructions.</i></p>
+            """
+        )
+        layout.addWidget(viewer)
+        buttons = QHBoxLayout()
+        if report.recalibration_recommended:
+            recalibrate = QPushButton("Recalibrate before next session")
+            recalibrate.clicked.connect(self._request_recalibration)
+            buttons.addWidget(recalibrate)
+        close = QPushButton("Close report")
+        close.clicked.connect(self.accept)
+        buttons.addStretch()
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+
+    def _request_recalibration(self) -> None:
+        self.recalibrate_requested = True
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -359,8 +409,11 @@ class MainWindow(QMainWindow):
         self.save_button = QPushButton("Save summary")
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save)
+        self.report_button = QPushButton("Latest report")
+        self.report_button.clicked.connect(self._show_latest_report)
         buttons.addWidget(self.primary)
         buttons.addWidget(self.save_button)
+        buttons.addWidget(self.report_button)
         scroll.setWidget(side_content)
         right.addWidget(scroll, 1)
         right.addLayout(buttons)
@@ -719,6 +772,10 @@ class MainWindow(QMainWindow):
             "timestamp": datetime.now(UTC).isoformat(), "frame_id": len(self.frames),
             "angle_deg": round(angle, 3), "progress_deg": round(movement_progress, 3),
             "score": round(live_score, 3), "confidence": round(confidence, 3),
+            "tracked_confidence": round(tracked_confidence, 3),
+            "posture_ok": posture_ok,
+            "coach_phase": coach_update.phase.value,
+            "repetition_index": coach_update.repetitions,
         })
         if coach_update.phase == CoachPhase.COMPLETE:
             self.state = SessionState.COMPLETE
@@ -894,14 +951,29 @@ class MainWindow(QMainWindow):
         progress_values = [float(frame.get("progress_deg", 0)) for frame in self.frames]
         exercise_id = EXERCISES[self.exercise.currentIndex()].id
         baseline = self.baselines.get(exercise_id)
+        posture_values = [bool(frame.get("posture_ok")) for frame in self.frames]
+        tracking_values = [
+            float(frame.get("tracked_confidence", frame.get("confidence", 0)))
+            for frame in self.frames
+        ]
         return {
             "schema_version": SCHEMA_VERSION,
             "algorithm_version": "provisional-0.1",
             "exercise_id": exercise_id,
             "started_at": self.started_at.isoformat(),
+            "ended_at": datetime.now(UTC).isoformat(),
             "score": round(float(np.mean(scores)), 2) if scores else 0.0,
             "achieved_rom_deg": round(max(progress_values), 2) if progress_values else 0.0,
             "repetitions": self.coach.repetitions if self.coach else 0,
+            "prescribed_repetitions": self.coach.target_repetitions if self.coach else 0,
+            "posture_adherence_pct": (
+                round(100 * sum(posture_values) / len(posture_values), 2)
+                if posture_values else 0.0
+            ),
+            "tracking_coverage_pct": (
+                round(100 * sum(value >= 0.25 for value in tracking_values) / len(tracking_values), 2)
+                if tracking_values else 0.0
+            ),
             "patient_id": self.patient_id,
             "validation_status": "investigational",
             "personalization": {
@@ -914,6 +986,7 @@ class MainWindow(QMainWindow):
                 "comfortable_rom_deg": baseline.comfortable_rom_deg if baseline else None,
                 "target_rom_deg": baseline.target_rom_deg if baseline else None,
                 "rest_value_deg": baseline.rest_value_deg if baseline else None,
+                "calibrated_at": baseline.calibrated_at if baseline else None,
             },
             "frames": self.frames,
         }
@@ -923,6 +996,9 @@ class MainWindow(QMainWindow):
             self.status.setText("Complete the guided repetitions before saving the session summary.")
             return
         payload = self._payload()
+        previous_sessions = self.repo.list_sessions()
+        report = build_session_report(payload, previous_sessions)
+        payload["report"] = report.to_dict()
         session_id = self.repo.save_session(self.patient_id, payload)
         payload["session_id"] = session_id
         export_session(payload, DATA_DIR / "exports")
@@ -939,6 +1015,40 @@ class MainWindow(QMainWindow):
         self.motivation.setText("Great work showing up today. Recovery is built one session at a time.")
         self.save_button.setEnabled(False)
         self.stage.setText("✓  PROFILE   →   ✓  CALIBRATE   →   ✓  MOVE   →   ●  PROGRESS")
+        self._show_report(payload, report)
+
+    def _show_latest_report(self) -> None:
+        exercise_id = EXERCISES[self.exercise.currentIndex()].id
+        rows = [
+            row for row in self.repo.list_sessions()
+            if row.get("patient_id") == self.patient_id
+            and row.get("exercise_id") == exercise_id
+        ]
+        if not rows:
+            self.status.setText("No completed report is available for this exercise yet.")
+            return
+        payload = rows[0]
+        report = build_session_report(payload, rows[1:])
+        self._show_report(payload, report)
+
+    def _show_report(self, payload: dict[str, object], report: SessionReport) -> None:
+        exercise_id = str(payload.get("exercise_id", ""))
+        exercise_name = next(
+            (exercise.name for exercise in EXERCISES if exercise.id == exercise_id),
+            exercise_id,
+        )
+        dialog = SessionReportDialog(exercise_name, report, self)
+        dialog.exec()
+        if dialog.recalibrate_requested:
+            self.repo.delete_baseline(self.patient_id, exercise_id)
+            self.baselines.pop(exercise_id, None)
+            self.coach = None
+            self.state = SessionState.READY
+            self.calibration_armed = False
+            self.primary.setText("Start recalibration")
+            self.status.setText(
+                "Fresh calibration scheduled. Your previous sessions and Day-1 reference are preserved."
+            )
 
     def _refresh_sessions(self) -> None:
         rows = self.repo.list_sessions()

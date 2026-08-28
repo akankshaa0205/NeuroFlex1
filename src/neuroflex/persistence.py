@@ -65,18 +65,19 @@ class SessionRepository:
 
     def save_session(self, patient_id: str, payload: dict[str, object]) -> str:
         session_id = str(uuid4())
+        stored_payload = {**payload, "session_id": session_id, "patient_id": patient_id}
         with self.connect() as db:
             db.execute(
                 "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     patient_id,
-                    payload["exercise_id"],
-                    payload["started_at"],
-                    payload["score"],
-                    payload["repetitions"],
-                    payload["algorithm_version"],
-                    json.dumps(payload, separators=(",", ":")),
+                    stored_payload["exercise_id"],
+                    stored_payload["started_at"],
+                    stored_payload["score"],
+                    stored_payload["repetitions"],
+                    stored_payload["algorithm_version"],
+                    json.dumps(stored_payload, separators=(",", ":")),
                 ),
             )
         return session_id
@@ -115,6 +116,13 @@ class SessionRepository:
         with self.connect() as db:
             db.execute("DELETE FROM baselines WHERE patient_id = ?", (patient_id,))
 
+    def delete_baseline(self, patient_id: str, exercise_id: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM baselines WHERE patient_id = ? AND exercise_id = ?",
+                (patient_id, exercise_id),
+            )
+
     def list_sessions(self) -> list[dict[str, object]]:
         with self.connect() as db:
             rows = db.execute("SELECT payload FROM sessions ORDER BY started_at DESC").fetchall()
@@ -132,7 +140,8 @@ def export_session(payload: dict[str, object], directory: Path) -> tuple[Path, P
     if isinstance(frames, list):
         temporary_csv = csv_path.with_suffix(".csv.tmp")
         columns = [
-            "timestamp", "frame_id", "angle_deg", "progress_deg", "score", "confidence"
+            "timestamp", "frame_id", "angle_deg", "progress_deg", "score", "confidence",
+            "tracked_confidence", "posture_ok", "coach_phase", "repetition_index",
         ]
         with temporary_csv.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=columns)
