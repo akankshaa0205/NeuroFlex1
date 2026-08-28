@@ -31,9 +31,9 @@ class SessionCoach:
         target_repetitions: int,
         *,
         preparation_seconds: float = 5.0,
-        target_dwell_seconds: float = 0.8,
-        hold_seconds: float = 1.2,
-        return_dwell_seconds: float = 0.6,
+        target_dwell_seconds: float = 0.35,
+        hold_seconds: float = 0.9,
+        return_dwell_seconds: float = 0.35,
         rest_seconds: float = 2.0,
     ) -> None:
         self.target_repetitions = target_repetitions
@@ -92,7 +92,7 @@ class SessionCoach:
             )
 
         if self.phase == CoachPhase.MOVE_OUT:
-            if progress_ratio >= 0.85:
+            if progress_ratio >= 0.75:
                 if self._threshold_since is None:
                     self._threshold_since = now
                 elif now - self._threshold_since >= self.target_dwell_seconds:
@@ -111,7 +111,7 @@ class SessionCoach:
             return self._result("Hold this comfortable position. Keep breathing.")
 
         if self.phase == CoachPhase.RETURN:
-            if progress_ratio <= 0.25:
+            if progress_ratio <= 0.35:
                 if self._threshold_since is None:
                     self._threshold_since = now
                 elif now - self._threshold_since >= self.return_dwell_seconds:

@@ -12,9 +12,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 Allow Windows camera access when prompted. Stand far enough back for all joints used by the selected exercise to remain visible. Your image is processed locally and is not recorded.
 
 The joints used by the selected exercise are highlighted in yellow. The current phase and a large
-`REPS completed / target` counter remain over the camera view. Keep **Speak phase instructions
-aloud** enabled for optional Windows voice prompts; the visual coach works normally if speech is
-unavailable or disabled. Older saved baselines are recalibrated once so posture can be judged
+`REPS completed / target` counter remain over the camera view. Older saved baselines are
+recalibrated once so posture can be judged
 relative to the user's natural starting pose instead of the camera placement.
 
 ## First-time setup

@@ -9,10 +9,8 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
-from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -24,6 +22,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -51,6 +50,7 @@ class PoseCanvas(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.landmarks: np.ndarray | None = None
+        self.visibility: np.ndarray | None = None
         self.frame: QImage | None = None
         self.feedback = "Stand where your full body is visible"
         self.phase_text = "READY"
@@ -65,21 +65,38 @@ class PoseCanvas(QWidget):
         painter.fillRect(self.rect(), QColor("#08111f"))
         if self.frame is not None:
             scaled = self.frame.scaled(
-                self.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                self.size(), Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            painter.drawImage(0, 0, scaled)
+            frame_x = (self.width() - scaled.width()) / 2
+            frame_y = (self.height() - scaled.height()) / 2
+            painter.drawImage(round(frame_x), round(frame_y), scaled)
             painter.fillRect(self.rect(), QColor(2, 10, 22, 48))
         else:
             painter.fillRect(QRectF(18, 18, self.width() - 36, self.height() - 36), QColor("#0d2037"))
         if self.landmarks is not None:
-            points = [QPointF(p[0] * self.width(), p[1] * self.height()) for p in self.landmarks]
+            if self.frame is not None:
+                scaled = self.frame.scaled(
+                    self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+                frame_x = (self.width() - scaled.width()) / 2
+                frame_y = (self.height() - scaled.height()) / 2
+                points = [
+                    QPointF(frame_x + p[0] * scaled.width(), frame_y + p[1] * scaled.height())
+                    for p in self.landmarks
+                ]
+            else:
+                points = [QPointF(p[0] * self.width(), p[1] * self.height()) for p in self.landmarks]
+            visible = self.visibility if self.visibility is not None else np.ones(len(points))
             painter.setPen(QPen(QColor(0, 0, 0, 180), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             for left, right in SKELETON_EDGES:
-                painter.drawLine(points[left], points[right])
+                if min(visible[left], visible[right]) >= 0.25:
+                    painter.drawLine(points[left], points[right])
             painter.setPen(QPen(QColor("#34d399" if self.good else "#fb7185"), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             for left, right in SKELETON_EDGES:
-                painter.drawLine(points[left], points[right])
+                if min(visible[left], visible[right]) >= 0.25:
+                    painter.drawLine(points[left], points[right])
             if self.focus_indices is not None:
                 first, middle, last = self.focus_indices
                 painter.setPen(QPen(QColor("#fbbf24"), 9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -88,6 +105,8 @@ class PoseCanvas(QWidget):
             painter.setBrush(QColor("#f8fafc"))
             painter.setPen(Qt.PenStyle.NoPen)
             for index in range(len(points)):
+                if visible[index] < 0.25:
+                    continue
                 radius = 8 if self.focus_indices and index in self.focus_indices else 5
                 painter.drawEllipse(points[index], radius, radius)
         painter.setPen(QColor("#e2e8f0"))
@@ -107,6 +126,7 @@ class MetricCard(QFrame):
     def __init__(self, title: str, value: str, accent: str) -> None:
         super().__init__()
         self.setObjectName("card")
+        self.setMinimumHeight(88)
         layout = QVBoxLayout(self)
         heading = QLabel(title.upper())
         heading.setObjectName("muted")
@@ -201,8 +221,10 @@ class MainWindow(QMainWindow):
         self.calibration_rest_samples: list[float] = []
         self.calibration_posture_samples: list[float] = []
         self.calibration_started = 0.0
+        self.calibration_valid_elapsed = 0.0
+        self.calibration_last_valid_at: float | None = None
         self.calibration_armed = False
-        self.last_spoken_phase: CoachPhase | None = None
+        self.tracking_lost_at: float | None = None
         self._load_personalization()
         self.started_at = datetime.now(UTC)
         self.coach: SessionCoach | None = None
@@ -214,26 +236,19 @@ class MainWindow(QMainWindow):
                 self.camera_error = "Camera permission or device access is unavailable"
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             self.camera_error = str(error)
-        self.speech: QTextToSpeech | None = None
-        speech_engines = [
-            engine for engine in QTextToSpeech.availableEngines() if engine != "mock"
-        ]
-        if speech_engines:
-            self.speech = QTextToSpeech(self)
-            self.speech.setRate(-0.18)
-            self.speech.setVolume(0.85)
         self._build_ui()
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick)
+        self.timer.timeout.connect(self._safe_tick)
         self.timer.start(50)
 
     def _load_personalization(self) -> None:
         profile = self.repo.load_profile(self.patient_id)
         if profile:
+            # Older prototypes stored only an age band and could silently select the wrong arm.
+            # Require the clearer current intake once instead of migrating an unsafe assumption.
+            if "age_band" in profile:
+                return
             profile.setdefault("body_area", "Shoulder")
-            if "age_years" not in profile:
-                old_band = str(profile.pop("age_band", "50–64"))
-                profile["age_years"] = 70 if "65" in old_band else 55
             self.intake = PatientIntake(**profile)
         for data in self.repo.load_baselines(self.patient_id):
             if "rest_value_deg" not in data or "posture_reference_deg" not in data:
@@ -270,7 +285,15 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 18, 0, 0)
         self.canvas = PoseCanvas()
         layout.addWidget(self.canvas, 3)
-        side = QVBoxLayout()
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        side_content = QWidget()
+        side = QVBoxLayout(side_content)
+        side.setContentsMargins(0, 0, 6, 0)
         self.stage = QLabel("1  PROFILE   →   2  CALIBRATE   →   3  MOVE   →   4  PROGRESS")
         self.stage.setObjectName("stage")
         self.stage.setWordWrap(True)
@@ -320,12 +343,6 @@ class MainWindow(QMainWindow):
         self.motivation.setObjectName("motivation")
         self.motivation.setWordWrap(True)
         side.addWidget(self.motivation)
-        self.audio_enabled = QCheckBox("Speak phase instructions aloud")
-        self.audio_enabled.setChecked(self.speech is not None)
-        self.audio_enabled.setEnabled(self.speech is not None)
-        if self.speech is None:
-            self.audio_enabled.setText("Audio coach unavailable on this system")
-        side.addWidget(self.audio_enabled)
         self.status = QLabel("Ready when you are")
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
@@ -339,13 +356,14 @@ class MainWindow(QMainWindow):
         self.save_button.clicked.connect(self._save)
         buttons.addWidget(self.primary)
         buttons.addWidget(self.save_button)
-        side.addLayout(buttons)
+        scroll.setWidget(side_content)
+        right.addWidget(scroll, 1)
+        right.addLayout(buttons)
         controls = QLabel("Use the large Start/Pause button. Touchless gestures remain a validation feature.")
         controls.setObjectName("muted")
         controls.setWordWrap(True)
-        side.addWidget(controls)
-        side.addStretch()
-        layout.addLayout(side, 2)
+        right.addWidget(controls)
+        layout.addLayout(right, 2)
         return page
 
     def _clinician_view(self) -> QWidget:
@@ -411,6 +429,8 @@ class MainWindow(QMainWindow):
             self.calibration_rest_samples = []
             self.calibration_posture_samples = []
             self.calibration_started = time.monotonic()
+            self.calibration_valid_elapsed = 0.0
+            self.calibration_last_valid_at = None
             self.progress_history = {"Left": [], "Right": []}
             self.primary.setEnabled(False)
             self.primary.setText("Calibrating…")
@@ -482,6 +502,22 @@ class MainWindow(QMainWindow):
         else:
             self.status.setText("Exercise changed • a short personal calibration is required")
 
+    def _safe_tick(self) -> None:
+        try:
+            self._tick()
+        except Exception as error:  # noqa: BLE001 - Qt callbacks need a crash boundary.
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with (DATA_DIR / "runtime-error.log").open("a", encoding="utf-8") as log:
+                log.write(f"{datetime.now(UTC).isoformat()} {type(error).__name__}: {error}\n")
+            self.state = SessionState.PAUSED
+            self.canvas.good = False
+            self.canvas.feedback = "Movement tracking had a problem. Your session is safely paused."
+            self.canvas.phase_text = "PAUSED — RETRY"
+            self.status.setText("Tracking paused safely. Press Resume slowly to try again.")
+            self.primary.setEnabled(True)
+            self.primary.setText("Resume slowly")
+            self.canvas.update()
+
     def _tick(self) -> None:
         self.phase += 0.12
         landmarks: np.ndarray | None = None
@@ -493,20 +529,30 @@ class MainWindow(QMainWindow):
                 self.canvas.frame = QImage(
                     rgb.data, width, height, channels * width, QImage.Format.Format_RGB888
                 ).copy()
+                self.canvas.visibility = self.camera.last_visibility.copy()
                 self.camera_error = None
             except (OSError, RuntimeError, ValueError) as error:
                 self.camera_error = str(error)
         if landmarks is None:
+            now = time.monotonic()
+            if self.tracking_lost_at is None:
+                self.tracking_lost_at = now
+            missing_for = now - self.tracking_lost_at
+            self.calibration_last_valid_at = None
             if self.camera_error:
                 self.canvas.feedback = f"Camera unavailable: {self.camera_error}"
                 self.canvas.update()
             elif self.canvas.frame is not None:
-                self.canvas.feedback = "Move back until the joints used by this exercise are visible"
+                self.canvas.feedback = "Hold still for a moment while I find your joints"
                 self.canvas.update()
-            if self.state != SessionState.ACTIVE:
+            if missing_for < 1.0:
                 return
             self.canvas.landmarks = None
-            self.canvas.feedback = "Pose not detected — step back and keep your full body in frame"
+            self.canvas.visibility = None
+            if self.state not in {SessionState.ACTIVE, SessionState.CALIBRATING}:
+                return
+            exercise = EXERCISES[self.exercise.currentIndex()]
+            self.canvas.feedback = self._framing_cue(exercise)
             self.canvas.phase_text = "PAUSED — FINDING BODY"
             if self.coach is not None:
                 self.coach.pause(time.monotonic())
@@ -519,9 +565,9 @@ class MainWindow(QMainWindow):
             right_visibility = self._triplet_visibility(
                 tuple(index + 1 for index in exercise.joint_triplet)
             )
-            if max(left_visibility, right_visibility) < 0.35:
+            if max(left_visibility, right_visibility) < 0.25:
                 self.canvas.feedback = (
-                    f"Move farther back — the {exercise.body_region.lower()} joints must be visible"
+                    self._framing_cue(exercise)
                 )
             else:
                 self.canvas.feedback = (
@@ -533,9 +579,14 @@ class MainWindow(QMainWindow):
         if self.state not in {SessionState.ACTIVE, SessionState.CALIBRATING}:
             return
         exercise = EXERCISES[self.exercise.currentIndex()]
-        left_angle = extract_joint_angle(landmarks, exercise.joint_triplet)
+        geometry = (
+            self.camera.last_world_landmarks
+            if self.camera is not None and self.camera.last_world_landmarks is not None
+            else landmarks
+        )
+        left_angle = extract_joint_angle(geometry, exercise.joint_triplet)
         right_triplet = tuple(index + 1 for index in exercise.joint_triplet)
-        right_angle = extract_joint_angle(landmarks, right_triplet)
+        right_angle = extract_joint_angle(geometry, right_triplet)
         signals = {
             "Left": movement_signal(left_angle, exercise.movement_mode),
             "Right": movement_signal(right_angle, exercise.movement_mode),
@@ -553,24 +604,34 @@ class MainWindow(QMainWindow):
         )
         self.canvas.focus_indices = tracked_triplet
         tracked_confidence = self._triplet_visibility(tracked_triplet)
-        if tracked_confidence < 0.35:
+        if tracked_confidence < 0.25:
+            now = time.monotonic()
+            if self.tracking_lost_at is None:
+                self.tracking_lost_at = now
+            if now - self.tracking_lost_at < 0.8:
+                self.canvas.feedback = "Keep moving slowly — tracking is stabilizing"
+                self.canvas.update()
+                return
             self.canvas.good = False
-            self.canvas.feedback = (
-                f"{self.active_side} {exercise.body_region.lower()} not fully visible — move back"
-            )
+            self.canvas.feedback = self._framing_cue(exercise)
             self.status.setText("Measurement paused until all required joints are visible")
             self.canvas.phase_text = "PAUSED — REPOSITION"
             if self.coach is not None:
                 self.coach.pause(time.monotonic())
             self.canvas.update()
             return
+        self.tracking_lost_at = None
         angle = left_angle if self.active_side == "Left" else right_angle
         signal_value = signals[self.active_side]
         if self.state == SessionState.CALIBRATING:
-            elapsed = time.monotonic() - self.calibration_started
+            now = time.monotonic()
+            if self.calibration_last_valid_at is not None:
+                self.calibration_valid_elapsed += min(0.12, now - self.calibration_last_valid_at)
+            self.calibration_last_valid_at = now
+            elapsed = self.calibration_valid_elapsed
             if elapsed <= 1.0:
                 self.calibration_rest_samples.append(signal_value)
-                self.calibration_posture_samples.append(torso_lean_degrees(landmarks))
+                self.calibration_posture_samples.append(torso_lean_degrees(geometry))
                 phase_message = "Hold your comfortable starting pose"
             else:
                 self.calibration_samples.append(signal_value)
@@ -579,7 +640,7 @@ class MainWindow(QMainWindow):
             posture_reference = (
                 float(np.median(self.calibration_posture_samples))
                 if self.calibration_posture_samples
-                else torso_lean_degrees(landmarks)
+                else torso_lean_degrees(geometry)
             )
             calibration_peak = max(
                 (abs(sample - rest_value) for sample in self.calibration_samples), default=0.0
@@ -620,7 +681,7 @@ class MainWindow(QMainWindow):
         self.canvas.landmarks = landmarks
         self.canvas.feedback = f"{self.active_side} side • {assessment.current_ratio:.0%} of your target"
         assert self.coach is not None
-        raw_posture_ok = self._posture_ok(landmarks, exercise, baseline)
+        raw_posture_ok = self._posture_ok(geometry, exercise, baseline)
         self.posture_history = [*self.posture_history[-11:], raw_posture_ok]
         posture_ok = sum(self.posture_history) >= max(1, round(len(self.posture_history) * 0.75))
         coach_update = self.coach.update(
@@ -691,6 +752,14 @@ class MainWindow(QMainWindow):
             return 0.0
         return float(np.min(self.camera.last_visibility[np.asarray(triplet)]))
 
+    @staticmethod
+    def _framing_cue(exercise) -> str:
+        if exercise.body_region in {"Shoulder", "Elbow"}:
+            return "Show your working hip, shoulder and arm. You do not need to show your legs."
+        if exercise.body_region in {"Hip", "Knee", "Ankle", "Full body"}:
+            return "Step back until your working hip, knee and foot are visible."
+        return "Keep your shoulders and hips visible in the camera."
+
     def _refresh_guidance(self) -> None:
         exercise = EXERCISES[self.exercise.currentIndex()]
         guide = guidance_for(exercise.id)
@@ -731,17 +800,23 @@ class MainWindow(QMainWindow):
             CoachPhase.COMPLETE: "SESSION COMPLETE",
             CoachPhase.IDLE: "READY",
         }
-        self.status.setText(update.instruction)
+        exercise = EXERCISES[self.exercise.currentIndex()]
+        if update.phase == CoachPhase.MOVE_OUT:
+            instruction = (
+                f"{self.active_side.upper()} SIDE — "
+                f"{exercise.cue_low.replace('your arm', f'your {self.active_side.lower()} arm')}. "
+                "Move slowly and stop before pain."
+            )
+        elif update.phase == CoachPhase.HOLD:
+            instruction = "That is enough. Hold gently and keep breathing."
+        elif update.phase == CoachPhase.RETURN:
+            instruction = "Now return slowly to your starting position to complete the repetition."
+        else:
+            instruction = update.instruction
+        self.status.setText(instruction)
         self.motivation.setText(self._motivation_for_phase(update.phase))
         self.canvas.phase_text = phase_names[update.phase]
         self.canvas.rep_text = f"{update.repetitions} / {update.target_repetitions}"
-        if (
-            update.phase != self.last_spoken_phase
-            and self.audio_enabled.isChecked()
-            and self.speech is not None
-        ):
-            self.speech.say(update.instruction)
-        self.last_spoken_phase = update.phase
 
     def _payload(self) -> dict[str, object]:
         scores = [float(frame["score"]) for frame in self.frames]

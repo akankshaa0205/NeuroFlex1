@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -27,14 +28,17 @@ class LivePoseCamera:
             self.capture = cv2.VideoCapture(camera_index)
         options = mp.tasks.vision.PoseLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            running_mode=mp.tasks.vision.RunningMode.VIDEO,
             num_poses=1,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_pose_detection_confidence=0.35,
+            min_pose_presence_confidence=0.35,
+            min_tracking_confidence=0.35,
         )
         self.landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
         self.last_visibility = np.zeros(33, dtype=np.float64)
+        self.last_world_landmarks: np.ndarray | None = None
+        self._last_timestamp_ms = 0
+        self._smoothed_coordinates: np.ndarray | None = None
 
     @property
     def available(self) -> bool:
@@ -46,18 +50,34 @@ class LivePoseCamera:
             raise RuntimeError("The camera did not return a frame")
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = self.landmarker.detect(
-            self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = max(self._last_timestamp_ms + 1, time.monotonic_ns() // 1_000_000)
+        self._last_timestamp_ms = timestamp_ms
+        result = self.landmarker.detect_for_video(
+            self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb),
+            timestamp_ms,
         )
         if not result.pose_landmarks:
+            self.last_world_landmarks = None
+            self._smoothed_coordinates = None
             return rgb, None, 0.0
         landmarks = result.pose_landmarks[0]
         coordinates = np.asarray(
             [[point.x, point.y, point.z] for point in landmarks], dtype=np.float64
         )
+        if self._smoothed_coordinates is None:
+            self._smoothed_coordinates = coordinates
+        else:
+            # Temporal tracking removes the distracting frame-to-frame skeleton jitter while
+            # retaining enough responsiveness for deliberately slow rehabilitation movement.
+            self._smoothed_coordinates = 0.65 * self._smoothed_coordinates + 0.35 * coordinates
         visibility = [point.visibility or 0.0 for point in landmarks]
         self.last_visibility = np.asarray(visibility, dtype=np.float64)
-        return rgb, coordinates, float(np.mean(visibility))
+        if result.pose_world_landmarks:
+            world = result.pose_world_landmarks[0]
+            self.last_world_landmarks = np.asarray(
+                [[point.x, point.y, point.z] for point in world], dtype=np.float64
+            )
+        return rgb, self._smoothed_coordinates.copy(), float(np.mean(visibility))
 
     def close(self) -> None:
         self.capture.release()

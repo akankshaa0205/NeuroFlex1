@@ -15,8 +15,6 @@ NeuroFlex now has a reviewer-ready Windows desktop prototype rather than only a 
 - Day-1 session performance is retained as the patient’s own reference. Later sessions show score and ROM changes from Day 1 in both the save confirmation and clinician history.
 - A four-stage patient journey, large motivational card, progressive encouragement, safe visibility/form gating, and positive completion messages.
 - A deterministic slow-session coach: five-second preparation, target dwell, gentle hold, controlled return, validated repetition, and two-second rest. Instructions remain stable within each phase instead of reacting to every camera frame.
-- Optional asynchronous Windows text-to-speech announces each new phase once, while keeping every
-  instruction visible for accessibility and silent environments.
 - Exercise-specific START, MOVE, and FORM instructions for every supported movement, posture checks
   relative to the user's calibrated starting pose, and automatic session pause when required joints
   leave the frame.
