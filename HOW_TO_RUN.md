@@ -16,10 +16,10 @@ Allow Windows camera access when prompted. Stand far enough back for all joints 
 If dependencies need to be restored:
 
 ```powershell
-python -m pip install --user uv
-python -m uv sync --dev --extra pose
-python -m uv run python scripts/check_system.py
-python -m uv run neuroflex
+py -3.11 -m pip install --user uv
+py -3.11 -m uv sync --dev --extra pose
+.\.venv\Scripts\python.exe scripts\check_system.py
+.\.venv\Scripts\python.exe -m neuroflex
 ```
 
 In the app, select an exercise and press **Start session**. Complete the short intake, including exact age and the body area to work on. Read the visible START, MOVE, and FORM instructions before pressing **Begin calibration**. During the five-second calibration, hold the starting pose for one second, perform one slow comfortable movement, and return.
@@ -31,8 +31,8 @@ The first saved session becomes the Day-1 performance reference; later saves rep
 ## Verification
 
 ```powershell
-python -m uv run pytest
-python -m uv run ruff check .
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\ruff.exe check .
 ```
 
 For GPU validation, upload `colab/NeuroFlex_CUDA_Validation.ipynb` to Google Colab, choose **Runtime → Change runtime type → GPU**, and run the cells in order.

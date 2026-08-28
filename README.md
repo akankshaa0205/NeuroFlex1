@@ -7,8 +7,8 @@ NeuroFlex is an investigational, touchless physical-rehabilitation assessment pr
 ## Run locally
 
 ```powershell
-python -m uv sync --dev
-python -m uv run neuroflex
+py -3.11 -m uv sync --dev --extra pose
+.\.venv\Scripts\python.exe -m neuroflex
 ```
 
 The project-local virtual environment is `.venv`. The Windows demo uses the included MediaPipe model for a live 33-landmark webcam overlay. A deterministic synthetic provider supports tests, while the CUDA validation path remains replaceable behind the pose boundary.
@@ -16,8 +16,8 @@ The project-local virtual environment is `.venv`. The Windows demo uses the incl
 ## Tests
 
 ```powershell
-python -m uv run pytest
-python -m uv run ruff check .
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\ruff.exe check .
 ```
 
 Business tests cover vectorized joint angles, scoring bounds, DTW determinism, repetition state, gesture debounce/cooldown, and transactional persistence/export. GPU and clinical dataset validation are separate non-blocking gates.
