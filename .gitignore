@@ -11,3 +11,22 @@ build/
 *.egg-info/
 .idea/
 .vscode/
+
+# Downloaded research datasets and generated model weights are local-only.
+data/raw/
+data/processed/
+artifacts/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Local report and presentation build output.
+.report_build/
+.review_ppt_build/
+review_outputs/
+.chart-data-*/
+
+# Disposable local analysis files (including extracted paper text).
+tmp/

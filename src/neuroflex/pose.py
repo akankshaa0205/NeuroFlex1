@@ -16,7 +16,13 @@ class PoseEstimator(Protocol):
 class LivePoseCamera:
     """Local webcam + MediaPipe pose adapter. Frames are never written to disk."""
 
-    def __init__(self, model_path: Path, camera_index: int = 0) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        gesture_model_path: Path | None = None,
+        hand_model_path: Path | None = None,
+        camera_index: int = 0,
+    ) -> None:
         import mediapipe as mp
 
         self._mp = mp
@@ -35,6 +41,31 @@ class LivePoseCamera:
             min_tracking_confidence=0.35,
         )
         self.landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
+        self.gesture_recognizer = None
+        self.gesture_error: str | None = "Gesture classifier or hand landmark model not configured"
+        self.last_gesture: tuple[str | None, float] = (None, 0.0)
+        self.gesture_threshold = 1.0
+        self._gesture_model = None
+        if gesture_model_path is not None and hand_model_path is not None:
+            try:
+                import joblib
+
+                artifact = joblib.load(gesture_model_path)
+                self._gesture_model = artifact["model"]
+                self.gesture_threshold = float(artifact["threshold"])
+                hand_options = mp.tasks.vision.HandLandmarkerOptions(
+                    base_options=mp.tasks.BaseOptions(model_asset_path=str(hand_model_path)),
+                    running_mode=mp.tasks.vision.RunningMode.VIDEO,
+                    num_hands=1,
+                    min_hand_detection_confidence=0.5,
+                    min_hand_presence_confidence=0.5,
+                )
+                self.gesture_recognizer = (
+                    mp.tasks.vision.HandLandmarker.create_from_options(hand_options)
+                )
+                self.gesture_error = None
+            except (ImportError, KeyError, OSError, TypeError, ValueError) as error:
+                self.gesture_error = str(error)
         self.last_visibility = np.zeros(33, dtype=np.float64)
         self.last_world_landmarks: np.ndarray | None = None
         self._last_timestamp_ms = 0
@@ -56,6 +87,7 @@ class LivePoseCamera:
             self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb),
             timestamp_ms,
         )
+        self._recognize_gesture(rgb, timestamp_ms)
         if not result.pose_landmarks:
             self.last_world_landmarks = None
             self._smoothed_coordinates = None
@@ -79,9 +111,35 @@ class LivePoseCamera:
             )
         return rgb, self._smoothed_coordinates.copy(), float(np.mean(visibility))
 
+    def _recognize_gesture(self, rgb: np.ndarray, timestamp_ms: int) -> None:
+        self.last_gesture = (None, 0.0)
+        if self.gesture_recognizer is None or self._gesture_model is None:
+            return
+        result = self.gesture_recognizer.detect_for_video(
+            self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb), timestamp_ms
+        )
+        if not result.hand_landmarks:
+            return
+        hand = np.asarray(
+            [[point.x, point.y, point.z] for point in result.hand_landmarks[0]],
+            dtype=np.float32,
+        )
+        centered = hand - hand[:1]
+        scale = float(np.max(np.linalg.norm(centered[:, :2], axis=1)))
+        if scale <= 1e-6:
+            return
+        probabilities = self._gesture_model.predict_proba((centered / scale).reshape(1, -1))[0]
+        index = int(np.argmax(probabilities))
+        self.last_gesture = (
+            str(self._gesture_model.classes_[index]),
+            float(probabilities[index]),
+        )
+
     def close(self) -> None:
         self.capture.release()
         self.landmarker.close()
+        if self.gesture_recognizer is not None:
+            self.gesture_recognizer.close()
 
 
 def synthetic_pose(phase: float) -> np.ndarray:

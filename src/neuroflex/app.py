@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,20 +34,46 @@ from PySide6.QtWidgets import (
 )
 
 from neuroflex.domain.coach import CoachPhase, CoachUpdate, SessionCoach
-from neuroflex.domain.exercises import EXERCISES, movement_signal
+from neuroflex.domain.exercises import CORE_EXERCISE_IDS, EXERCISES, movement_signal
 from neuroflex.domain.feedback import assess_live_movement, choose_active_side
 from neuroflex.domain.gestures import GestureDebouncer, hands_together_at_chest
 from neuroflex.domain.guidance import guidance_for
-from neuroflex.domain.kinematics import extract_joint_angle, smooth_angles, torso_lean_degrees
+from neuroflex.domain.kimore import KimoreQualityEstimator, pose_to_kimore_angles
+from neuroflex.domain.kinematics import smooth_angles, torso_lean_degrees
 from neuroflex.domain.models import PatientIntake, PersonalBaseline, SessionState
 from neuroflex.domain.personalization import personalized_target, readiness_message
 from neuroflex.domain.progress import summarize_progress
 from neuroflex.domain.reports import SessionReport, build_session_report
 from neuroflex.persistence import SCHEMA_VERSION, SessionRepository, export_session
 from neuroflex.pose import SKELETON_EDGES, LivePoseCamera
+from neuroflex.runtime import HybridAngleEngine, LatestItemWorker, compute_status_text
 
 DATA_DIR = Path.home() / ".neuroflex"
 MODEL_PATH = Path(__file__).parents[2] / "models" / "pose_landmarker_full.task"
+HAND_MODEL_PATH = (
+    Path(__file__).parents[2] / "data" / "raw" / "hagrid" / "models" / "hand_landmarker.task"
+)
+GESTURE_MODEL_PATH = Path(__file__).parents[2] / "artifacts" / "gesture_mlp.joblib"
+KIMORE_MODEL_PATH = Path(__file__).parents[2] / "artifacts" / "kimore_quality.joblib"
+KIMORE_EXERCISE_MAP = {
+    "shoulder-flexion": "Es1",
+    "shoulder-abduction": "Es1",
+    "trunk-side-bend": "Es2",
+    "sit-to-stand": "Es5",
+    "knee-flexion": "Es5",
+}
+
+
+@dataclass(slots=True)
+class CameraSample:
+    rgb: np.ndarray | None
+    landmarks: np.ndarray | None
+    confidence: float
+    visibility: np.ndarray
+    world_landmarks: np.ndarray | None
+    gesture: tuple[str | None, float]
+    gesture_threshold: float
+    error: str | None = None
 
 
 class PoseCanvas(QWidget):
@@ -61,6 +87,7 @@ class PoseCanvas(QWidget):
         self.rep_text = "0 / 8"
         self.focus_indices: tuple[int, int, int] | None = None
         self.good = True
+        self.gesture_debug = ""
         self.setMinimumSize(620, 500)
 
     def paintEvent(self, event) -> None:
@@ -69,7 +96,8 @@ class PoseCanvas(QWidget):
         painter.fillRect(self.rect(), QColor("#08111f"))
         if self.frame is not None:
             scaled = self.frame.scaled(
-                self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
             frame_x = (self.width() - scaled.width()) / 2
@@ -77,11 +105,14 @@ class PoseCanvas(QWidget):
             painter.drawImage(round(frame_x), round(frame_y), scaled)
             painter.fillRect(self.rect(), QColor(2, 10, 22, 48))
         else:
-            painter.fillRect(QRectF(18, 18, self.width() - 36, self.height() - 36), QColor("#0d2037"))
+            painter.fillRect(
+                QRectF(18, 18, self.width() - 36, self.height() - 36), QColor("#0d2037")
+            )
         if self.landmarks is not None:
             if self.frame is not None:
                 scaled = self.frame.scaled(
-                    self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.FastTransformation,
                 )
                 frame_x = (self.width() - scaled.width()) / 2
@@ -91,19 +122,32 @@ class PoseCanvas(QWidget):
                     for p in self.landmarks
                 ]
             else:
-                points = [QPointF(p[0] * self.width(), p[1] * self.height()) for p in self.landmarks]
+                points = [
+                    QPointF(p[0] * self.width(), p[1] * self.height()) for p in self.landmarks
+                ]
             visible = self.visibility if self.visibility is not None else np.ones(len(points))
-            painter.setPen(QPen(QColor(0, 0, 0, 180), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setPen(
+                QPen(QColor(0, 0, 0, 180), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            )
             for left, right in SKELETON_EDGES:
                 if min(visible[left], visible[right]) >= 0.25:
                     painter.drawLine(points[left], points[right])
-            painter.setPen(QPen(QColor("#34d399" if self.good else "#fb7185"), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setPen(
+                QPen(
+                    QColor("#34d399" if self.good else "#fb7185"),
+                    6,
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap,
+                )
+            )
             for left, right in SKELETON_EDGES:
                 if min(visible[left], visible[right]) >= 0.25:
                     painter.drawLine(points[left], points[right])
             if self.focus_indices is not None:
                 first, middle, last = self.focus_indices
-                painter.setPen(QPen(QColor("#fbbf24"), 9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.setPen(
+                    QPen(QColor("#fbbf24"), 9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+                )
                 painter.drawLine(points[first], points[middle])
                 painter.drawLine(points[middle], points[last])
             painter.setBrush(QColor("#f8fafc"))
@@ -124,6 +168,14 @@ class PoseCanvas(QWidget):
         painter.drawText(QRectF(44, self.height() - 82, 178, 22), self.phase_text)
         painter.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
         painter.drawText(QRectF(44, self.height() - 61, 178, 28), f"REPS  {self.rep_text}")
+        if self.gesture_debug:
+            painter.setPen(QColor("#fef3c7"))
+            painter.setFont(QFont("Consolas", 10, QFont.Weight.DemiBold))
+            painter.drawText(
+                QRectF(30, 72, self.width() - 60, 24),
+                Qt.AlignmentFlag.AlignRight,
+                self.gesture_debug,
+            )
 
 
 class MetricCard(QFrame):
@@ -159,9 +211,7 @@ class IntakeDialog(QDialog):
         self.age.setValue(60)
         self.age.setSuffix(" years")
         self.area = QComboBox()
-        self.area.addItems(
-            ["Shoulder", "Elbow", "Hip", "Knee", "Ankle", "Trunk", "Full body"]
-        )
+        self.area.addItems(["Shoulder", "Elbow", "Hip", "Knee", "Ankle", "Trunk", "Full body"])
         self.side = QComboBox()
         self.side.addItems(["Right", "Left", "Either"])
         self.mobility = QComboBox()
@@ -200,8 +250,12 @@ class IntakeDialog(QDialog):
 
     def intake(self) -> PatientIntake:
         return PatientIntake(
-            self.age.value(), self.area.currentText(), self.side.currentText(),
-            self.mobility.currentText(), self.goal.currentText(), self.discomfort.value(),
+            self.age.value(),
+            self.area.currentText(),
+            self.side.currentText(),
+            self.mobility.currentText(),
+            self.goal.currentText(),
+            self.discomfort.value(),
         )
 
 
@@ -263,6 +317,8 @@ class MainWindow(QMainWindow):
         self.state = SessionState.READY
         self.phase = 0.0
         self.frames: list[dict[str, object]] = []
+        self.kimore_angles: list[np.ndarray] = []
+        self.kimore_prediction: dict[str, object] | None = None
         self.progress_history: dict[str, list[float]] = {"Left": [], "Right": []}
         self.active_side = "Left"
         self.previous_progress: float | None = None
@@ -283,18 +339,68 @@ class MainWindow(QMainWindow):
         self._load_personalization()
         self.started_at = datetime.now(UTC)
         self.coach: SessionCoach | None = None
+        self.angle_engine = HybridAngleEngine("auto")
+        self.kimore_estimator: KimoreQualityEstimator | None = None
+        self.kimore_worker: LatestItemWorker[tuple[np.ndarray, str], object] | None = None
+        if KIMORE_MODEL_PATH.exists():
+            try:
+                self.kimore_estimator = KimoreQualityEstimator(KIMORE_MODEL_PATH)
+                self.kimore_worker = LatestItemWorker(
+                    lambda request: self.kimore_estimator.predict(*request), max_pending=1
+                )
+                self.kimore_worker.start()
+            except (OSError, ValueError, KeyError):
+                self.kimore_estimator = None
         self.camera: LivePoseCamera | None = None
+        self.camera_worker: LatestItemWorker[int, CameraSample] | None = None
+        self.pose_visibility = np.zeros(33, dtype=np.float64)
+        self.world_landmarks: np.ndarray | None = None
         self.camera_error: str | None = None
         try:
-            self.camera = LivePoseCamera(MODEL_PATH)
+            self.camera = LivePoseCamera(
+                MODEL_PATH,
+                GESTURE_MODEL_PATH if GESTURE_MODEL_PATH.exists() else None,
+                HAND_MODEL_PATH if HAND_MODEL_PATH.exists() else None,
+            )
             if not self.camera.available:
                 self.camera_error = "Camera permission or device access is unavailable"
+            else:
+                self.camera_worker = LatestItemWorker(self._capture_camera, max_pending=1)
+                self.camera_worker.start()
+                self.camera_worker.submit(0)
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             self.camera_error = str(error)
         self._build_ui()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._safe_tick)
         self.timer.start(50)
+
+    def _capture_camera(self, _: int) -> CameraSample:
+        assert self.camera is not None
+        try:
+            rgb, landmarks, confidence = self.camera.read()
+            return CameraSample(
+                rgb,
+                landmarks,
+                confidence,
+                self.camera.last_visibility.copy(),
+                None
+                if self.camera.last_world_landmarks is None
+                else self.camera.last_world_landmarks.copy(),
+                getattr(self.camera, "last_gesture", None) or (None, 0.0),
+                float(getattr(self.camera, "gesture_threshold", 1.0)),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return CameraSample(
+                None,
+                None,
+                0.0,
+                np.zeros(33, dtype=np.float64),
+                None,
+                (None, 0.0),
+                1.0,
+                str(error),
+            )
 
     def _load_personalization(self) -> None:
         profile = self.repo.load_profile(self.patient_id)
@@ -359,7 +465,12 @@ class MainWindow(QMainWindow):
         title = QLabel("Today’s movement")
         title.setObjectName("muted")
         self.exercise = QComboBox()
-        self.exercise.addItems([item.name for item in EXERCISES])
+        self.exercise.addItems(
+            [
+                f"{item.name}  •  {'Core' if item.id in CORE_EXERCISE_IDS else 'Experimental'}"
+                for item in EXERCISES
+            ]
+        )
         self.exercise.setCurrentIndex(0)
         self.exercise.currentIndexChanged.connect(self._exercise_changed)
         self.exercise.setMinimumHeight(46)
@@ -386,9 +497,11 @@ class MainWindow(QMainWindow):
         self.score_card = MetricCard("Live score", "—", "#60a5fa")
         self.angle_card = MetricCard("Joint angle", "—", "#34d399")
         self.rep_card = MetricCard("Repetitions", "0 / 8", "#fbbf24")
+        self.kimore_card = MetricCard("KIMORE quality", "collecting", "#c084fc")
         metrics.addWidget(self.score_card, 0, 0)
         metrics.addWidget(self.angle_card, 0, 1)
-        metrics.addWidget(self.rep_card, 1, 0, 1, 2)
+        metrics.addWidget(self.rep_card, 1, 0)
+        metrics.addWidget(self.kimore_card, 1, 1)
         side.addLayout(metrics)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -417,17 +530,21 @@ class MainWindow(QMainWindow):
         scroll.setWidget(side_content)
         right.addWidget(scroll, 1)
         right.addLayout(buttons)
-        controls = QLabel("Use the large Start/Pause button. Touchless gestures remain a validation feature.")
+        controls = QLabel(
+            "Use the large Start/Pause button. Touchless gestures remain a validation feature."
+        )
         controls.setObjectName("muted")
         controls.setWordWrap(True)
         right.addWidget(controls)
+        self.compute_status = QLabel(compute_status_text(self.angle_engine.device))
+        self.compute_status.setObjectName("computeStatus")
+        self.compute_status.setWordWrap(True)
+        right.addWidget(self.compute_status)
         self.gesture_enabled = QCheckBox("Enable touch-free gesture controls")
         self.gesture_enabled.setChecked(False)
         self.gesture_enabled.toggled.connect(self._gesture_toggled)
         right.addWidget(self.gesture_enabled)
-        self.gesture_status = QLabel(
-            "Gestures off • buttons always remain available"
-        )
+        self.gesture_status = QLabel("Gestures off • buttons always remain available")
         self.gesture_status.setObjectName("muted")
         self.gesture_status.setWordWrap(True)
         right.addWidget(self.gesture_status)
@@ -510,6 +627,8 @@ class MainWindow(QMainWindow):
         if self.state in {SessionState.READY, SessionState.PAUSED, SessionState.COMPLETE}:
             if self.state in {SessionState.READY, SessionState.COMPLETE}:
                 self.frames = []
+                self.kimore_angles = []
+                self.kimore_prediction = None
                 self.progress_history = {"Left": [], "Right": []}
                 self.previous_progress = None
                 self.posture_history = []
@@ -554,6 +673,8 @@ class MainWindow(QMainWindow):
 
     def _exercise_changed(self) -> None:
         self.frames = []
+        self.kimore_angles = []
+        self.kimore_prediction = None
         self.progress_history = {"Left": [], "Right": []}
         self.coach = None
         self.calibration_armed = False
@@ -588,20 +709,34 @@ class MainWindow(QMainWindow):
 
     def _tick(self) -> None:
         self.phase += 0.12
+        if self.kimore_worker is not None:
+            prediction = self.kimore_worker.get_latest_result()
+            if prediction is not None:
+                self.kimore_prediction = asdict(prediction)
+                self.kimore_card.value.setText(f"{prediction.quality_percent:.0f}%")
         landmarks: np.ndarray | None = None
         confidence = 0.0
-        if self.camera is not None and self.camera.available:
-            try:
-                rgb, landmarks, confidence = self.camera.read()
+        if self.camera_worker is not None:
+            sample = self.camera_worker.get_latest_result()
+            self.camera_worker.submit(round(self.phase * 1000))
+            if sample is not None and sample.error is None and sample.rgb is not None:
+                rgb, landmarks, confidence = sample.rgb, sample.landmarks, sample.confidence
                 height, width, channels = rgb.shape
                 self.canvas.frame = QImage(
                     rgb.data, width, height, channels * width, QImage.Format.Format_RGB888
                 ).copy()
-                self.canvas.visibility = self.camera.last_visibility.copy()
+                self.pose_visibility = sample.visibility
+                self.world_landmarks = sample.world_landmarks
+                self.canvas.visibility = sample.visibility
                 self.camera_error = None
-                self._process_gesture(landmarks)
-            except (OSError, RuntimeError, ValueError) as error:
-                self.camera_error = str(error)
+                self._process_gesture(
+                    landmarks,
+                    visibility=sample.visibility,
+                    predicted=sample.gesture,
+                    threshold=sample.gesture_threshold,
+                )
+            elif sample is not None:
+                self.camera_error = sample.error
         if landmarks is None:
             now = time.monotonic()
             if self.tracking_lost_at is None:
@@ -635,9 +770,7 @@ class MainWindow(QMainWindow):
                 tuple(index + 1 for index in exercise.joint_triplet)
             )
             if max(left_visibility, right_visibility) < 0.25:
-                self.canvas.feedback = (
-                    self._framing_cue(exercise)
-                )
+                self.canvas.feedback = self._framing_cue(exercise)
             else:
                 self.canvas.feedback = (
                     "Required joints detected — press Start session"
@@ -648,14 +781,11 @@ class MainWindow(QMainWindow):
         if self.state not in {SessionState.ACTIVE, SessionState.CALIBRATING}:
             return
         exercise = EXERCISES[self.exercise.currentIndex()]
-        geometry = (
-            self.camera.last_world_landmarks
-            if self.camera is not None and self.camera.last_world_landmarks is not None
-            else landmarks
-        )
-        left_angle = extract_joint_angle(geometry, exercise.joint_triplet)
+        geometry = self.world_landmarks if self.world_landmarks is not None else landmarks
         right_triplet = tuple(index + 1 for index in exercise.joint_triplet)
-        right_angle = extract_joint_angle(geometry, right_triplet)
+        left_angle, right_angle = self.angle_engine.calculate(
+            geometry, [exercise.joint_triplet, right_triplet]
+        )
         signals = {
             "Left": movement_signal(left_angle, exercise.movement_mode),
             "Right": movement_signal(right_angle, exercise.movement_mode),
@@ -705,7 +835,11 @@ class MainWindow(QMainWindow):
             else:
                 self.calibration_samples.append(signal_value)
                 phase_message = "Move comfortably, then return"
-            rest_value = float(np.median(self.calibration_rest_samples)) if self.calibration_rest_samples else signal_value
+            rest_value = (
+                float(np.median(self.calibration_rest_samples))
+                if self.calibration_rest_samples
+                else signal_value
+            )
             posture_reference = (
                 float(np.median(self.calibration_posture_samples))
                 if self.calibration_posture_samples
@@ -725,9 +859,7 @@ class MainWindow(QMainWindow):
             self.progress.setValue(min(100, round(elapsed / 5.0 * 100)))
             self.canvas.update()
             if elapsed >= 5.0:
-                self._finish_calibration(
-                    exercise, calibration_peak, rest_value, posture_reference
-                )
+                self._finish_calibration(exercise, calibration_peak, rest_value, posture_reference)
             return
         baseline = self.baselines[exercise.id]
         history = [
@@ -748,7 +880,9 @@ class MainWindow(QMainWindow):
         )
         live_score = assessment.score
         self.canvas.landmarks = landmarks
-        self.canvas.feedback = f"{self.active_side} side • {assessment.current_ratio:.0%} of your target"
+        self.canvas.feedback = (
+            f"{self.active_side} side • {assessment.current_ratio:.0%} of your target"
+        )
         assert self.coach is not None
         raw_posture_ok = self._posture_ok(geometry, exercise, baseline)
         self.posture_history = [*self.posture_history[-11:], raw_posture_ok]
@@ -768,15 +902,38 @@ class MainWindow(QMainWindow):
             f"{coach_update.repetitions} / {coach_update.target_repetitions}"
         )
         self.progress.setValue(round(live_score))
-        self.frames.append({
-            "timestamp": datetime.now(UTC).isoformat(), "frame_id": len(self.frames),
-            "angle_deg": round(angle, 3), "progress_deg": round(movement_progress, 3),
-            "score": round(live_score, 3), "confidence": round(confidence, 3),
-            "tracked_confidence": round(tracked_confidence, 3),
-            "posture_ok": posture_ok,
-            "coach_phase": coach_update.phase.value,
-            "repetition_index": coach_update.repetitions,
-        })
+        self.frames.append(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "frame_id": len(self.frames),
+                "angle_deg": round(angle, 3),
+                "progress_deg": round(movement_progress, 3),
+                "score": round(live_score, 3),
+                "confidence": round(confidence, 3),
+                "tracked_confidence": round(tracked_confidence, 3),
+                "posture_ok": posture_ok,
+                "coach_phase": coach_update.phase.value,
+                "repetition_index": coach_update.repetitions,
+            }
+        )
+        kimore_exercise = KIMORE_EXERCISE_MAP.get(exercise.id)
+        if self.kimore_estimator is not None and kimore_exercise is not None:
+            try:
+                self.kimore_angles.append(pose_to_kimore_angles(geometry))
+                if (
+                    self.kimore_worker is not None
+                    and len(self.kimore_angles) >= 20
+                    and len(self.kimore_angles) % 10 == 0
+                ):
+                    self.kimore_worker.submit(
+                        (np.asarray(self.kimore_angles), kimore_exercise)
+                    )
+            except ValueError:
+                self.kimore_card.value.setText("unavailable")
+        elif self.kimore_estimator is None:
+            self.kimore_card.value.setText("model absent")
+        else:
+            self.kimore_card.value.setText("not mapped")
         if coach_update.phase == CoachPhase.COMPLETE:
             self.state = SessionState.COMPLETE
             self.primary.setText("Start another")
@@ -802,7 +959,10 @@ class MainWindow(QMainWindow):
             )
             return
         baseline = PersonalBaseline(
-            exercise.id, self.active_side, comfortable_rom, target,
+            exercise.id,
+            self.active_side,
+            comfortable_rom,
+            target,
             rest_value if rest_value is not None else 0.0,
             posture_reference if posture_reference is not None else 0.0,
             datetime.now(UTC).isoformat(),
@@ -823,11 +983,12 @@ class MainWindow(QMainWindow):
     def _triplet_visibility(self, triplet: tuple[int, int, int]) -> float:
         if self.camera is None:
             return 0.0
-        return float(np.min(self.camera.last_visibility[np.asarray(triplet)]))
+        return float(np.min(self.pose_visibility[np.asarray(triplet)]))
 
     def _gesture_toggled(self, enabled: bool) -> None:
         self.gesture_debouncer.clear()
         if not enabled:
+            self.canvas.gesture_debug = ""
             self.gesture_status.setText("Gestures off • buttons always remain available")
         elif self.camera is None or not self.camera.available:
             self.gesture_enabled.setChecked(False)
@@ -837,7 +998,7 @@ class MainWindow(QMainWindow):
                 "Bring both hands together at chest height and hold to start, pause, or resume"
             )
 
-    def _process_gesture(self, landmarks: np.ndarray | None) -> None:
+    def _process_gesture_legacy(self, landmarks: np.ndarray | None) -> None:
         if not self.gesture_enabled.isChecked() or self.camera is None:
             return
         action: str | None = None
@@ -861,9 +1022,7 @@ class MainWindow(QMainWindow):
             landmarks if landmarks is not None else np.empty((0, 3)),
             self.camera.last_visibility,
         )
-        fired = self.gesture_debouncer.update(
-            "hands_together" if detected else None, confidence
-        )
+        fired = self.gesture_debouncer.update("hands_together" if detected else None, confidence)
         if self.gesture_debouncer.candidate is not None:
             percent = round(self.gesture_debouncer.progress * 100)
             self.gesture_status.setText(
@@ -876,9 +1035,89 @@ class MainWindow(QMainWindow):
         if fired is not None:
             self._primary_action()
             result_text = {"start": "started", "resume": "resumed", "pause": "paused"}
+            self.gesture_status.setText(f"Gesture accepted • session {result_text[action]}")
+
+    def _process_gesture(
+        self,
+        landmarks: np.ndarray | None,
+        *,
+        visibility: np.ndarray | None = None,
+        predicted: tuple[str | None, float] | None = None,
+        threshold: float | None = None,
+    ) -> None:
+        if not self.gesture_enabled.isChecked() or self.camera is None:
+            return
+        detected, together_confidence = hands_together_at_chest(
+            landmarks if landmarks is not None else np.empty((0, 3)),
+            self.camera.last_visibility if visibility is None else visibility,
+        )
+        predicted_label, model_confidence = (
+            getattr(self.camera, "last_gesture", None) or (None, 0.0)
+            if predicted is None
+            else predicted
+        )
+        model_threshold = (
+            float(getattr(self.camera, "gesture_threshold", 1.0))
+            if threshold is None
+            else threshold
+        )
+        accepted = (
+            predicted_label
+            if predicted_label != "no_gesture" and model_confidence >= model_threshold
+            else None
+        )
+        label = "hands_together" if detected else accepted
+        confidence = together_confidence if detected else model_confidence
+        fired = self.gesture_debouncer.update(label, confidence)
+        cooldown = getattr(self.gesture_debouncer, "_cooldown", 0)
+        self.canvas.gesture_debug = (
+            f"Gesture: {predicted_label or 'none'} {model_confidence:.1%} | "
+            f"hold {self.gesture_debouncer.progress:.0%} | cooldown {cooldown}"
+        )
+        if self.gesture_debouncer.candidate is not None:
             self.gesture_status.setText(
-                f"Gesture accepted • session {result_text[action]}"
+                f"{self.gesture_debouncer.candidate} recognized ({confidence:.0%}) - "
+                f"keep holding {self.gesture_debouncer.progress:.0%}"
             )
+        else:
+            self.gesture_status.setText(
+                "Commands: like=start, palm=pause, peace=next, fist=repeat, one=select"
+            )
+        if fired is not None:
+            self.gesture_status.setText(f"Gesture accepted - {self._execute_gesture(fired)}")
+
+    def _execute_gesture(self, gesture: str) -> str:
+        if gesture == "hands_together":
+            if self.state in {SessionState.ACTIVE, SessionState.PAUSED}:
+                self._primary_action()
+                return "session toggled"
+            return "hands together ignored in this state"
+        if gesture == "like":
+            if self.state in {SessionState.READY, SessionState.PAUSED}:
+                self._primary_action()
+                return "session started/resumed"
+            return "start ignored in this state"
+        if gesture == "palm":
+            if self.state == SessionState.ACTIVE:
+                self._primary_action()
+                return "session paused"
+            return "pause ignored in this state"
+        if gesture == "peace":
+            if self.state not in {SessionState.ACTIVE, SessionState.CALIBRATING}:
+                self.exercise.setCurrentIndex((self.exercise.currentIndex() + 1) % len(EXERCISES))
+                return "next exercise"
+            return "next ignored during movement"
+        if gesture == "fist":
+            if self.state == SessionState.COMPLETE:
+                self._primary_action()
+                return "exercise repeated"
+            return "repeat ignored until completion"
+        if gesture == "one":
+            if self.state == SessionState.READY:
+                self._primary_action()
+                return "selection confirmed"
+            return "select ignored in this state"
+        return "unknown gesture ignored"
 
     @staticmethod
     def _framing_cue(exercise) -> str:
@@ -896,15 +1135,11 @@ class MainWindow(QMainWindow):
         )
 
     @staticmethod
-    def _posture_ok(
-        landmarks: np.ndarray, exercise, baseline: PersonalBaseline
-    ) -> bool:
+    def _posture_ok(landmarks: np.ndarray, exercise, baseline: PersonalBaseline) -> bool:
         if exercise.id == "trunk-side-bend":
             return True
         limit = 35 if exercise.id == "sit-to-stand" else 20
-        return (
-            abs(torso_lean_degrees(landmarks) - baseline.posture_reference_deg) <= limit
-        )
+        return abs(torso_lean_degrees(landmarks) - baseline.posture_reference_deg) <= limit
 
     @staticmethod
     def _motivation_for_phase(phase: CoachPhase) -> str:
@@ -956,7 +1191,7 @@ class MainWindow(QMainWindow):
             float(frame.get("tracked_confidence", frame.get("confidence", 0)))
             for frame in self.frames
         ]
-        return {
+        payload = {
             "schema_version": SCHEMA_VERSION,
             "algorithm_version": "provisional-0.1",
             "exercise_id": exercise_id,
@@ -967,12 +1202,14 @@ class MainWindow(QMainWindow):
             "repetitions": self.coach.repetitions if self.coach else 0,
             "prescribed_repetitions": self.coach.target_repetitions if self.coach else 0,
             "posture_adherence_pct": (
-                round(100 * sum(posture_values) / len(posture_values), 2)
-                if posture_values else 0.0
+                round(100 * sum(posture_values) / len(posture_values), 2) if posture_values else 0.0
             ),
             "tracking_coverage_pct": (
-                round(100 * sum(value >= 0.25 for value in tracking_values) / len(tracking_values), 2)
-                if tracking_values else 0.0
+                round(
+                    100 * sum(value >= 0.25 for value in tracking_values) / len(tracking_values), 2
+                )
+                if tracking_values
+                else 0.0
             ),
             "patient_id": self.patient_id,
             "validation_status": "investigational",
@@ -990,10 +1227,15 @@ class MainWindow(QMainWindow):
             },
             "frames": self.frames,
         }
+        if self.kimore_prediction is not None:
+            payload["kimore_quality"] = self.kimore_prediction
+        return payload
 
     def _save(self) -> None:
         if self.state != SessionState.COMPLETE:
-            self.status.setText("Complete the guided repetitions before saving the session summary.")
+            self.status.setText(
+                "Complete the guided repetitions before saving the session summary."
+            )
             return
         payload = self._payload()
         previous_sessions = self.repo.list_sessions()
@@ -1012,7 +1254,9 @@ class MainWindow(QMainWindow):
         else:
             message = "Day-1 session saved — this is your personal progress reference"
         self.status.setText(message)
-        self.motivation.setText("Great work showing up today. Recovery is built one session at a time.")
+        self.motivation.setText(
+            "Great work showing up today. Recovery is built one session at a time."
+        )
         self.save_button.setEnabled(False)
         self.stage.setText("✓  PROFILE   →   ✓  CALIBRATE   →   ✓  MOVE   →   ●  PROGRESS")
         self._show_report(payload, report)
@@ -1020,9 +1264,9 @@ class MainWindow(QMainWindow):
     def _show_latest_report(self) -> None:
         exercise_id = EXERCISES[self.exercise.currentIndex()].id
         rows = [
-            row for row in self.repo.list_sessions()
-            if row.get("patient_id") == self.patient_id
-            and row.get("exercise_id") == exercise_id
+            row
+            for row in self.repo.list_sessions()
+            if row.get("patient_id") == self.patient_id and row.get("exercise_id") == exercise_id
         ]
         if not rows:
             self.status.setText("No completed report is available for this exercise yet.")
@@ -1059,7 +1303,9 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             personalization = row.get("personalization", {})
-            target = personalization.get("target_rom_deg") if isinstance(personalization, dict) else None
+            target = (
+                personalization.get("target_rom_deg") if isinstance(personalization, dict) else None
+            )
             values = [
                 str(row.get("started_at", ""))[:10],
                 str(row.get("patient_id", "")),
@@ -1073,6 +1319,10 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row_index, column, QTableWidgetItem(value))
 
     def closeEvent(self, event) -> None:
+        if self.kimore_worker is not None:
+            self.kimore_worker.stop()
+        if self.camera_worker is not None:
+            self.camera_worker.stop()
         if self.camera is not None:
             self.camera.close()
         super().closeEvent(event)
@@ -1088,6 +1338,7 @@ QLabel#muted { color:#8fa3ba; font-size:13px; }
 QLabel#status { background:#10233a; border-left:4px solid #38bdf8; padding:14px; border-radius:5px; }
 QLabel#motivation { color:#d1fae5; background:#0b2e2a; border:1px solid #176b5b; border-radius:10px; padding:14px; font-size:17px; font-weight:700; }
 QLabel#guidance { color:#dbeafe; background:#0d2037; border:1px solid #294968; border-radius:10px; padding:12px; font-size:13px; }
+QLabel#computeStatus { color:#a7f3d0; background:#092b28; border:1px solid #176b5b; border-radius:8px; padding:8px 12px; font-size:12px; font-weight:700; }
 QFrame#card { background:#0e1d30; border:1px solid #203a57; border-radius:12px; padding:8px; }
 QPushButton { background:#172a43; border:1px solid #2a4765; border-radius:8px; padding:11px 16px; font-weight:600; }
 QPushButton:hover { background:#203b5c; }

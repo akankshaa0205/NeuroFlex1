@@ -1,0 +1,10 @@
+{
+  "seed": 20261025,
+  "device": "auto",
+  "warmup_iterations": 20,
+  "timed_iterations": 200,
+  "landmark_frames": 120,
+  "dtw_points": 120,
+  "queue_items": 500,
+  "queue_capacity": 2
+}
